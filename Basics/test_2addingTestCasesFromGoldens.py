@@ -3,28 +3,53 @@ import json
 import os
 
 import deepeval
+from langchain_ollama import ChatOllama
 from deepeval import evaluate
-from deepeval.dataset import EvaluationDataset, Golden
 from deepeval.evaluate import AsyncConfig
 from deepeval.metrics import AnswerRelevancyMetric
-from deepeval.models import OllamaModel
 from deepeval.test_case import LLMTestCase
-from dotenv import load_dotenv
-from langchain_ollama import ChatOllama
+from deepeval.models import OllamaModel
+from deepeval.dataset import EvaluationDataset, Golden
 
 
+# Upload results to Confident AI (comment out to run fully local
+# and save your 5 free test runs per week)
+deepeval.login(api_key=os.getenv("DeepEval_Key"))
+
+
+# How many questions to test. Keep it small while learning.
 MAX_GOLDENS = 10
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_FILE = PROJECT_ROOT / "dev.json"
+
+# dev.json lives in the project root, one level up from Basics/
+DATA_FILE = Path(__file__).parent.parent / "dev.json"
 
 
-def load_goldens(file_path: Path, limit: int) -> list[Golden]:
-    """Load up to `limit` unique question-answer pairs from a SQuAD JSON file."""
-    if limit <= 0:
-        raise ValueError("limit must be greater than zero.")
+# The judge model (grades the answers)
+Ollama_Eval_Model = OllamaModel(
+    model=os.getenv("LOCAL_MODEL_NAME"),
+    base_url=os.getenv("LOCAL_MODEL_BASE_URL")
+)
 
-    with file_path.open(encoding="utf-8") as file:
-        dev_data = json.load(file)
+# The model being tested (answers the questions)
+llm = ChatOllama(
+    base_url=os.getenv("LOCAL_MODEL_BASE_URL"),
+    model=os.getenv("LOCAL_MODEL_NAME"),
+    reasoning=False
+    )
+
+
+def get_llm_output(prompt):
+    return llm.invoke(prompt).content
+
+
+# Build the dataset from goldens
+#dataset = EvaluationDataset()
+#dataset.pull(alias="Adversial QA Dataset")
+
+def load_goldens(file_path, limit):
+    """Read SQuAD-style JSON and return up to `limit` unique goldens."""
+    with open(file_path, "r") as f:
+        dev_data = json.load(f)
 
     goldens = []
     seen_questions = set()
@@ -34,72 +59,46 @@ def load_goldens(file_path: Path, limit: int) -> list[Golden]:
             for qa in paragraph["qas"]:
                 question = qa["question"]
 
-                key = question.strip().casefold()
+                # Skip duplicate questions
+                key = question.strip().lower()
                 if key in seen_questions:
                     continue
-
-                if not qa["answers"]:
-                    continue
-
                 seen_questions.add(key)
-                expected = qa["answers"][0]["text"]
+
+                # First answer if there is one, otherwise None
+                expected = qa["answers"][0]["text"] if qa["answers"] else None
+
                 goldens.append(Golden(input=question, expected_output=expected))
 
+                # Stop as soon as we have enough
                 if len(goldens) >= limit:
                     return goldens
 
     return goldens
 
+# Step 1: load goldens from the local file (instead of dataset.pull)
+dataset = EvaluationDataset(goldens=load_goldens(DATA_FILE, MAX_GOLDENS))
 
-def main():
-    load_dotenv(PROJECT_ROOT / ".env.local")
+print(f"Goldens loaded: {len(dataset.goldens)}")
+assert len(dataset.goldens) > 0, "No goldens loaded! Check dev.json."
 
-    api_key = os.getenv("DeepEval_Key")
-    if api_key:
-        deepeval.login(api_key=api_key)
 
-    model_name = os.getenv("LOCAL_MODEL_NAME")
-    model_base_url = os.getenv("LOCAL_MODEL_BASE_URL")
-    if not model_name or not model_base_url:
-        raise ValueError(
-            "Set LOCAL_MODEL_NAME and LOCAL_MODEL_BASE_URL in .env.local."
+# Step 2: ask the model each question to turn goldens into test cases
+for golden in dataset.goldens:
+    dataset.add_test_case(
+        LLMTestCase(
+            input=golden.input,
+            expected_output=golden.expected_output,
+            actual_output=get_llm_output(golden.input),
         )
-
-    answer_model = ChatOllama(
-        base_url=model_base_url,
-        model=model_name,
-        reasoning=False,
     )
 
-    judge_model = OllamaModel(
-        model=model_name,
-        base_url=model_base_url,
-    )
-
-    dataset = EvaluationDataset(goldens=load_goldens(DATA_FILE, MAX_GOLDENS))
-    if not dataset.goldens:
-        raise ValueError(f"No answerable questions found in {DATA_FILE}.")
-
-    print(f"Goldens loaded: {len(dataset.goldens)}")
-
-    for golden in dataset.goldens:
-        response = answer_model.invoke(golden.input)
-        dataset.add_test_case(
-            LLMTestCase(
-                input=golden.input,
-                expected_output=golden.expected_output,
-                actual_output=response.content,
-            )
-        )
-
-    print(f"Test cases created: {len(dataset.test_cases)}")
-
-    evaluate(
-        test_cases=dataset.test_cases,
-        metrics=[AnswerRelevancyMetric(model=judge_model)],
-        async_config=AsyncConfig(run_async=False),
-    )
+print(f"Test cases created: {len(dataset.test_cases)}")
 
 
-if __name__ == "__main__":
-    main()
+# Step 3: grade the answers
+evaluate(
+    test_cases=dataset.test_cases,
+    metrics=[AnswerRelevancyMetric(model=Ollama_Eval_Model)],
+    async_config=AsyncConfig(run_async=False),
+)
